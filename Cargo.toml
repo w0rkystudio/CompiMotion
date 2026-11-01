@@ -1,0 +1,42 @@
+[package]
+name = "compimotion"
+version = "1.0.0"
+edition = "2024"
+description = "Windows için tek dosyalık, ücretsiz hareketli grafik ve video düzenleyici"
+license = "MIT"
+repository = "https://github.com/w0rkystudio/CompiMotion"
+
+[[bin]]
+name = "CompiMotion"
+path = "src/main.rs"
+
+[dependencies]
+ab_glyph = "0.2.32"
+base64 = "0.23.1"
+cpal = "0.18.2"
+eframe = { version = "0.37.0", features = ["glow", "persistence"] }
+egui = "0.37.0"
+gif = "0.14.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+quick-xml = "0.42.0"
+rayon = "1.12.0"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny-skia = "0.12.0"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Media_MediaFoundation", "Win32_Media_KernelStreaming", "Win32_Media_DirectShow", "Win32_UI_Shell_PropertiesSystem"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "unwind"
+
+[profile.dev]
+opt-level = 2
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
+
+
