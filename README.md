@@ -107,7 +107,7 @@ Windows'un yazı tipleri klasöründeki yazı tipleri gömülmez. Karşı taraft
 - **Yalnızca Windows.** Video ve ses, Windows Media Foundation ile işlenir.
 - **Efektler işlemcide hesaplanır.** Ağır projelerde önizleme takılabilir; önizleme kalitesini üst çubuktan düşürebilirsin. Örnek proje 720p'de saniyede yaklaşık 4-5 kare hızında dışa aktarılır.
 - **Windows N sürümleri** için Medya Özellik Paketi gerekir, yoksa uygulama açılmaz.
-- **Medya biçimleri** Windows'un açabildikleriyle sınırlıdır.
+- **Medya biçimleri** Windows'un açabildikleriyle sınırlıdır. 10-bit ve HDR videolar açılmaz, HEVC için Microsoft Store'daki HEVC uzantısı gerekir. Bu videoları 8-bit H.264'e dönüştürmek sorunu çözer.
 - **`.cmproj` proje dosyaları** medyayı yalnızca yol olarak saklar. Başkasına göndermek için XML paylaşımını kullan.
 - **Arayüz** şimdilik yalnızca Türkçedir.
 

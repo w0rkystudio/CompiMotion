@@ -1,6 +1,6 @@
 [package]
 name = "compimotion"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Windows için tek dosyalık, ücretsiz hareketli grafik ve video düzenleyici"
 license = "MIT"

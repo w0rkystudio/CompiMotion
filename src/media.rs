@@ -7,7 +7,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::System::Variant::VT_I8;
-use windows::core::{GUID, HSTRING};
+use windows::core::{GUID, HSTRING, Interface};
 
 pub const AUDIO_RATE: u32 = 48_000;
 
@@ -44,11 +44,115 @@ fn duration_of(reader: &IMFSourceReader) -> f64 {
     }
 }
 
+/// How decoded buffers map to the picture a player would show.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Layout {
+    /// Buffer size, which can include padding rows and columns the codec needs.
+    coded: (usize, usize),
+    /// Visible part of the buffer: x, y, width, height.
+    crop: (usize, usize, usize, usize),
+    /// Clockwise degrees to turn the picture, from the file's metadata.
+    rotation: u32,
+    /// Pixel width over pixel height; 1 for square pixels.
+    pixel_aspect: f64,
+    /// Row stride from the media type, if it states one.
+    stride: Option<i32>,
+}
+
+impl Layout {
+    /// Picture size after square-pixel correction and rotation.
+    fn display_size(&self) -> (usize, usize) {
+        let w = ((self.crop.2 as f64 * self.pixel_aspect).round() as usize).max(1);
+        if self.rotation == 90 || self.rotation == 270 { (self.crop.3, w) } else { (w, self.crop.3) }
+    }
+}
+
+/// Reads an MFVideoArea attribute as x, y, width, height.
+unsafe fn read_area(ty: &IMFMediaType, key: &GUID) -> Option<(i32, i32, i32, i32)> {
+    let mut b = [0u8; 16];
+    unsafe { ty.GetBlob(key, &mut b, None) }.ok()?;
+    let i16_at = |i: usize| i16::from_le_bytes([b[i], b[i + 1]]) as i32;
+    let i32_at = |i: usize| i32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    Some((i16_at(2), i16_at(6), i32_at(8), i32_at(12)))
+}
+
+unsafe fn read_layout(reader: &IMFSourceReader, stream: u32) -> windows::core::Result<Layout> {
+    unsafe {
+        let cur = reader.GetCurrentMediaType(stream)?;
+        let native = reader.GetNativeMediaType(stream, 0).ok();
+        let size = cur.GetUINT64(&MF_MT_FRAME_SIZE)?;
+        let coded = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
+
+        // The output type says what the converter delivers; the native type what the file says.
+        let types: Vec<&IMFMediaType> = std::iter::once(&cur).chain(native.iter()).collect();
+        let area = types.iter().find_map(|t| read_area(t, &MF_MT_MINIMUM_DISPLAY_APERTURE).or_else(|| read_area(t, &MF_MT_GEOMETRIC_APERTURE)));
+        let mut crop = (0, 0, coded.0, coded.1);
+        if let Some((x, y, w, h)) = area {
+            let fits = x >= 0 && y >= 0 && w > 0 && h > 0 && (x + w) as usize <= coded.0 && (y + h) as usize <= coded.1;
+            if fits {
+                crop = (x as usize, y as usize, w as usize, h as usize);
+            }
+        }
+        let rotation = types.iter().find_map(|t| t.GetUINT32(&MF_MT_VIDEO_ROTATION).ok().filter(|r| *r != 0)).unwrap_or(0) % 360;
+        let pixel_aspect = native
+            .as_ref()
+            .and_then(|t| t.GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO).ok())
+            .map(|r| ((r >> 32) as f64, (r & 0xffff_ffff) as f64))
+            .filter(|r| r.0 > 0.0 && r.1 > 0.0)
+            .map_or(1.0, |r| r.0 / r.1);
+        // Tiny ratios only come from rounding in the file, and would just soften the picture.
+        let pixel_aspect = if (pixel_aspect - 1.0).abs() < 0.01 { 1.0 } else { pixel_aspect.clamp(0.25, 4.0) };
+        let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok().map(|s| s as i32);
+        Ok(Layout { coded, crop, rotation, pixel_aspect, stride })
+    }
+}
+
+/// Copies the visible part of a BGRX buffer. `row` gives each coded row's bytes.
+fn frame_from_rows<'a>(l: &Layout, row: impl Fn(usize) -> Option<&'a [u8]> + Sync) -> Frame {
+    use rayon::prelude::*;
+    let (cx, cy, cw, ch) = l.crop;
+    let mut fr = Frame::new(cw, ch);
+    fr.px.par_chunks_mut(cw.max(1)).enumerate().for_each(|(y, out)| {
+        let Some(src) = row(cy + y).and_then(|r| r.get(cx * 4..(cx + cw) * 4)) else { return };
+        for (o, b) in out.iter_mut().zip(src.chunks_exact(4)) {
+            *o = [b[2] as f32 / 255.0, b[1] as f32 / 255.0, b[0] as f32 / 255.0, 1.0];
+        }
+    });
+    fr
+}
+
+/// Applies pixel aspect, then rotation, giving the picture as displayed.
+fn to_display(fr: Frame, l: &Layout) -> Frame {
+    let (src_w, src_h) = (fr.w as f32, fr.h as f32);
+    let squared = if l.pixel_aspect == 1.0 {
+        fr
+    } else {
+        let w = ((src_w as f64 * l.pixel_aspect).round() as usize).max(1);
+        let k = src_w / w as f32;
+        let mut o = Frame::new(w, fr.h);
+        o.shade(|x, y, _| fr.sample_clamp(x * k, y));
+        o
+    };
+    if l.rotation == 0 {
+        return squared;
+    }
+    let (w, h) = (squared.w as f32, squared.h as f32);
+    let (ow, oh) = if l.rotation == 180 { (squared.w, squared.h) } else { (squared.h, squared.w) };
+    let mut o = Frame::new(ow, oh);
+    let rot = l.rotation;
+    o.shade(|x, y, _| match rot {
+        90 => squared.sample_clamp(y, h - x),
+        180 => squared.sample_clamp(w - x, h - y),
+        _ => squared.sample_clamp(w - y, x),
+    });
+    o
+}
+
 pub struct VideoReader {
     reader: IMFSourceReader,
     pub w: usize,
     pub h: usize,
-    stride: i32,
+    layout: Layout,
     pub duration: f64,
     pub fps: f64,
     cache: Vec<(f64, f64, Arc<Frame>)>,
@@ -76,12 +180,11 @@ impl VideoReader {
             ty.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
             reader.SetCurrentMediaType(first_video, None, &ty)?;
             let cur = reader.GetCurrentMediaType(first_video)?;
-            let size = cur.GetUINT64(&MF_MT_FRAME_SIZE)?;
-            let (w, h) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
-            let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(w as i32 * 4);
+            let layout = read_layout(&reader, first_video)?;
+            let (w, h) = layout.display_size();
             let fps = cur.GetUINT64(&MF_MT_FRAME_RATE).map(|r| (r >> 32) as f64 / ((r & 0xffff_ffff) as f64).max(1.0)).unwrap_or(30.0);
             let duration = duration_of(&reader);
-            Ok(VideoReader { reader, w, h, stride, duration, fps: if fps > 0.0 { fps } else { 30.0 }, cache: vec![], pos: 0.0, eof: false })
+            Ok(VideoReader { reader, w, h, layout, duration, fps: if fps > 0.0 { fps } else { 30.0 }, cache: vec![], pos: 0.0, eof: false })
         }
     }
 
@@ -93,32 +196,60 @@ impl VideoReader {
                 self.eof = true;
                 return None;
             }
+            // A stream may change resolution partway through.
+            if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0 {
+                if let Ok(l) = read_layout(&self.reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32) {
+                    self.layout = l;
+                    (self.w, self.h) = l.display_size();
+                }
+            }
             let sample: IMFSample = sample?;
-            let buf = sample.ConvertToContiguousBuffer().ok()?;
-            let (mut ptr, mut len) = (std::ptr::null_mut(), 0u32);
-            buf.Lock(&mut ptr, None, Some(&mut len)).ok()?;
-            let data = std::slice::from_raw_parts(ptr, len as usize);
-            let f = self.convert(data);
-            let _ = buf.Unlock();
-            Some((ts as f64 / 1e7, Arc::new(f)))
+            let f = self.read_sample(&sample)?;
+            Some((ts as f64 / 1e7, Arc::new(to_display(f, &self.layout))))
         }
     }
 
-    fn convert(&self, d: &[u8]) -> Frame {
-        use rayon::prelude::*;
-        let (w, h) = (self.w, self.h);
-        let pitch = self.stride.unsigned_abs() as usize;
-        let mut fr = Frame::new(w, h);
-        // A negative stride means the buffer stores rows bottom-up.
-        let flip = self.stride < 0;
-        fr.px.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
-            let sy = if flip { h - 1 - y } else { y };
-            let Some(src) = d.get(sy * pitch..sy * pitch + w * 4) else { return };
-            for (o, b) in row.iter_mut().zip(src.chunks_exact(4)) {
-                *o = [b[2] as f32 / 255.0, b[1] as f32 / 255.0, b[0] as f32 / 255.0, 1.0];
+    unsafe fn read_sample(&self, sample: &IMFSample) -> Option<Frame> {
+        unsafe {
+            let l = self.layout;
+            let (cw, ch) = l.coded;
+            let row_bytes = cw * 4;
+            // A 2D buffer reports the real pitch; padding differs between decoders and sizes.
+            let single = if sample.GetBufferCount().ok()? == 1 { sample.GetBufferByIndex(0).ok() } else { None };
+            if let Some(b2d) = single.as_ref().and_then(|b| b.cast::<IMF2DBuffer>().ok()) {
+                let (mut scan0, mut pitch) = (std::ptr::null_mut(), 0i32);
+                if b2d.Lock2D(&mut scan0, &mut pitch).is_ok() {
+                    let base = scan0 as usize;
+                    let f = frame_from_rows(&l, |y| {
+                        if y >= ch {
+                            return None;
+                        }
+                        let at = (base as isize + y as isize * pitch as isize) as *const u8;
+                        Some(std::slice::from_raw_parts(at, row_bytes))
+                    });
+                    let _ = b2d.Unlock2D();
+                    return Some(f);
+                }
             }
-        });
-        fr
+            let buf = sample.ConvertToContiguousBuffer().ok()?;
+            let (mut ptr, mut len) = (std::ptr::null_mut(), 0u32);
+            buf.Lock(&mut ptr, None, Some(&mut len)).ok()?;
+            let data = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+            // Only trust the stated stride when it fits this buffer. Otherwise the padding is
+            // what is left per row; uncompressed RGB with no stated stride is stored bottom-up.
+            let stated = l.stride.filter(|s| {
+                let a = s.unsigned_abs() as usize;
+                a >= row_bytes && a * ch <= data.len()
+            });
+            let pitch = stated.map_or(data.len() / ch.max(1), |s| s.unsigned_abs() as usize);
+            let flip = stated.map_or(l.stride.is_none(), |s| s < 0);
+            let f = frame_from_rows(&l, |y| {
+                let sy = if flip { ch.checked_sub(1 + y)? } else { y };
+                data.get(sy * pitch..sy * pitch + row_bytes)
+            });
+            let _ = buf.Unlock();
+            Some(f)
+        }
     }
 
     pub fn frame_at(&mut self, t: f64) -> Option<Arc<Frame>> {
@@ -358,6 +489,112 @@ pub fn list_fonts() -> Vec<String> {
         }
     }
     all
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+
+    fn layout(coded: (usize, usize), crop: (usize, usize, usize, usize), rotation: u32, pixel_aspect: f64) -> Layout {
+        Layout { coded, crop, rotation, pixel_aspect, stride: None }
+    }
+
+    /// A 2x2 picture: red, green / blue, white. The red corner shows any turn.
+    fn corners() -> Frame {
+        let mut f = Frame::new(2, 2);
+        f.px = vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]];
+        f
+    }
+
+    #[test]
+    fn rows_use_the_real_pitch_and_visible_area() {
+        // 3 x 2 visible pixels at (1, 1) in a padded buffer, BGRX, pitch 32 instead of 5 * 4.
+        let (pitch, coded_h) = (32, 4);
+        let mut buf = vec![0u8; pitch * coded_h];
+        for y in 0..coded_h {
+            for x in 0..5 {
+                buf[y * pitch + x * 4] = (x * 10) as u8;
+                buf[y * pitch + x * 4 + 1] = (y * 10) as u8;
+            }
+        }
+        let l = layout((5, 4), (1, 1, 3, 2), 0, 1.0);
+        let f = frame_from_rows(&l, |y| buf.get(y * pitch..y * pitch + 20));
+        assert_eq!((f.w, f.h), (3, 2));
+        let at = |x: usize, y: usize| f.px[y * f.w + x];
+        assert!((at(0, 0)[2] - 10.0 / 255.0).abs() < 1e-5, "x kırpması");
+        assert!((at(0, 0)[1] - 10.0 / 255.0).abs() < 1e-5, "y kırpması");
+        assert!((at(2, 1)[2] - 30.0 / 255.0).abs() < 1e-5, "satır kaymamalı");
+        assert!((at(2, 1)[1] - 20.0 / 255.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rotation_turns_the_picture_clockwise() {
+        let close = |a: [f32; 4], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 0.01);
+        let (red, green, blue, white) = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 1.0]);
+        for (deg, want) in [(90, [blue, red, white, green]), (180, [white, blue, green, red]), (270, [green, white, red, blue])] {
+            let out = to_display(corners(), &layout((2, 2), (0, 0, 2, 2), deg, 1.0));
+            for i in 0..4 {
+                assert!(close(out.px[i], want[i]), "{deg} derece, piksel {i}: {:?}", out.px[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn display_size_applies_pixel_aspect_before_turning() {
+        assert_eq!(layout((720, 576), (0, 0, 720, 576), 0, 16.0 / 15.0).display_size(), (768, 576));
+        assert_eq!(layout((720, 576), (0, 0, 720, 576), 90, 16.0 / 15.0).display_size(), (576, 768));
+        assert_eq!(layout((856, 480), (0, 0, 854, 480), 0, 1.0).display_size(), (854, 480));
+        let wide = to_display(Frame::new(720, 4), &layout((720, 4), (0, 0, 720, 4), 0, 16.0 / 15.0));
+        assert_eq!((wide.w, wide.h), (768, 4));
+    }
+
+    /// Compares decoded frames with reference images: CM_VIDEO_DIR holds videos, each with a
+    /// "<file>.ref.png" made by ffmpeg at 1 s. Reports every file, then fails if any differ.
+    #[test]
+    #[ignore]
+    fn decoded_frames_match_references() {
+        let dir = std::env::var("CM_VIDEO_DIR").unwrap();
+        let (mut bad, mut names) = (vec![], vec![]);
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            if !name.ends_with(".ref.png") && !name.ends_with(".got.png") && p.with_file_name(format!("{name}.ref.png")).exists() {
+                names.push((p, name));
+            }
+        }
+        names.sort();
+        for (p, name) in names {
+            let reference = image::open(p.with_file_name(format!("{name}.ref.png"))).unwrap().to_rgba8();
+            let got = Assets::default().video_frame(&p.to_string_lossy(), 1.0);
+            let Some(got) = got else {
+                // Windows' H.264 decoder has no 10-bit support; the app reports this on import.
+                println!("VIDEO {name:30} ACILAMADI");
+                if !name.contains("10bit") {
+                    bad.push(name);
+                }
+                continue;
+            };
+            let _ = image::save_buffer(p.with_file_name(format!("{name}.got.png")), &got.to_rgba8(), got.w as u32, got.h as u32, image::ExtendedColorType::Rgba8);
+            let (rw, rh) = (reference.width() as usize, reference.height() as usize);
+            let mut sum = 0.0f64;
+            if (got.w, got.h) == (rw, rh) {
+                for (o, q) in got.px.iter().zip(reference.pixels()) {
+                    for c in 0..3 {
+                        sum += (o[c] as f64 - q[c] as f64 / 255.0).abs();
+                    }
+                }
+                sum /= (rw * rh * 3) as f64;
+            } else {
+                sum = 1.0;
+            }
+            let ok = sum < 0.04;
+            println!("VIDEO {name:30} okunan {}x{} referans {rw}x{rh} fark {sum:.3} {}", got.w, got.h, if ok { "tamam" } else { "BOZUK" });
+            if !ok {
+                bad.push(name);
+            }
+        }
+        assert!(bad.is_empty(), "bozuk: {bad:?}");
+    }
 }
 
 #[cfg(test)]

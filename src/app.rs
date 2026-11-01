@@ -701,8 +701,10 @@ impl Editor {
             }
             preload_audio(assets.clone(), p);
         } else {
-            let Some((w, h, d, fps)) = assets.video_info(&p) else {
-                self.status = Some(format!("Video açılamadı: {name}"));
+            // Opening can succeed while no frame ever decodes, so one frame is part of the check.
+            let info = assets.video_info(&p).filter(|_| assets.video_frame(&p, 0.0).is_some());
+            let Some((w, h, d, fps)) = info else {
+                self.status = Some(format!("Video açılamadı: {name}. Windows bu biçimi çözemiyor. 10-bit ve HDR videolar desteklenmiyor, HEVC için Microsoft Store'daki HEVC uzantısı gerekir. Videoyu 8-bit H.264'e dönüştürmek sorunu çözer."));
                 return;
             };
             let id = self.add_layer(&name, Content::Video { path: p.clone() });
